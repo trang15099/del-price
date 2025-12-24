@@ -1,4 +1,5 @@
 import io
+import re
 import streamlit as st
 import fitz  # PyMuPDF
 
@@ -7,59 +8,95 @@ st.title("Invoice PDF - Xóa giá")
 
 uploaded = st.file_uploader("Upload invoice PDF", type=["pdf"], accept_multiple_files=True)
 
-MARGIN = st.slider("Lề an toàn (px)", 0, 30, 6)
+# Lề an toàn nhỏ để che đúng chữ, không đè lên line
+#MARGIN = st.slider("Lề an toàn (px)", 0, 8, 2)
 
-def redact_like_sample(pdf_bytes: bytes, margin: int = 6) -> bytes:
+# Nhận diện token tiền: USD + các số dạng 151,308.00 / 467.0000000 / 0.00 / 0
+MONEY_TOKEN = re.compile(r"^(USD|\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+|\d+)$")
+
+TOTAL_LABELS = [
+    "SUB TOTAL AMOUNT",
+    "TAX AMOUNT",
+    "TOTAL WEEE AMOUNT",
+    "TOTAL AMOUNT",
+]
+
+def redact_like_sample(pdf_bytes: bytes, margin: int = 2) -> bytes:
+    """
+    Xóa giá bằng cách redact theo từng word bbox (USD + số tiền),
+    không che hình chữ nhật rộng => không đè đường gạch và không xóa label.
+    Giữ nguyên kích thước trang PDF.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     for page in doc:
-        pr = page.rect  # giữ nguyên size trang
+        words = page.get_text("words")
+        # words: [x0, y0, x1, y1, "text", block, line, word_no]
 
-        # 1) Che vùng giá của dòng hàng: từ cột UNIT PRICE sang phải, nhưng chỉ phần body (không che header)
+        # Gom words theo block+line để xử lý theo dòng
+        lines = {}
+        for (x0, y0, x1, y1, w, bno, lno, wno) in words:
+            key = (bno, lno)
+            lines.setdefault(key, []).append((x0, y0, x1, y1, w))
+
+        # Helper: redact đúng bbox của word (nhỏ, không đè line)
+        def redact_word_bbox(x0, y0, x1, y1):
+            r = fitz.Rect(x0 - margin, y0 - margin, x1 + margin, y1 + margin)
+            page.add_redact_annot(r, fill=(1, 1, 1))
+
+        # 1) Xác định mốc cột UNIT PRICE để biết vùng bên phải là giá
         unit_hdr = page.search_for("UNIT PRICE")
-        if unit_hdr:
-            u = unit_hdr[0]
-            x0 = max(0, u.x0 - margin)
+        unit_x0 = unit_hdr[0].x0 if unit_hdr else None
 
-            # body price area: lấy vị trí "USD" trong vùng bảng (khoảng y 250-320), rồi che đúng dải đó
-            usd_rects = page.search_for("USD")
-            body_usd = [r for r in usd_rects if 250 < r.y0 < 320]
-            if body_usd:
-                y0 = min(r.y0 for r in body_usd) - 6
-                y1 = max(r.y1 for r in body_usd) + 6
-            else:
-                y0 = u.y1 + 8
-                y1 = pr.height * 0.6
+        # 2) Xóa USD + số tiền trong vùng cột giá (bên phải UNIT PRICE)
+        if unit_x0 is not None:
+            for (x0, y0, x1, y1, w, *_rest) in words:
+                if x0 >= unit_x0 - 1:  # bên phải header UNIT PRICE
+                    if MONEY_TOKEN.match(w):
+                        redact_word_bbox(x0, y0, x1, y1)
 
-            # chặn đến trước phần totals nếu tìm thấy
-            sub = page.search_for("SUB TOTAL AMOUNT")
-            if sub:
-                y1 = min(y1, sub[0].y0 - 4)
+        # 3) Xóa số tiền ở khu totals: chỉ xóa token tiền bên phải label, giữ lại label
+        for lbl in TOTAL_LABELS:
+            rects = page.search_for(lbl)
+            for rlbl in rects:
+                # tìm line gần nhất với y của label
+                best_key = None
+                best_dy = 10**9
+                for (bno, lno), ws in lines.items():
+                    ly0 = min(t[1] for t in ws)  # y0 nhỏ nhất của line
+                    dy = abs(ly0 - rlbl.y0)
+                    if dy < best_dy:
+                        best_dy = dy
+                        best_key = (bno, lno)
 
-            page.add_redact_annot(fitz.Rect(x0, y0, pr.width, y1), fill=(1, 1, 1))
+                if best_key is None:
+                    continue
 
-        # 2) Che box totals bên phải (SUB TOTAL / TAX / TOTAL… + số tiền)
-        sub = page.search_for("SUB TOTAL AMOUNT")
-        total_amount = page.search_for("TOTAL AMOUNT")
-        if sub and total_amount:
-            y0 = sub[0].y0 - 6
-            y1 = total_amount[-1].y1 + 6
+                # redact token tiền nằm bên phải label trên line đó
+                for (x0, y0, x1, y1, w) in lines[best_key]:
+                    if x0 > rlbl.x1 + 3 and MONEY_TOKEN.match(w):
+                        redact_word_bbox(x0, y0, x1, y1)
 
-            usd_rects = page.search_for("USD")
-            totals_usd = [r for r in usd_rects if r.y0 >= y0 - 2 and r.y1 <= y1 + 2]
-            x0 = (min(r.x0 for r in totals_usd) - 10) if totals_usd else pr.width * 0.75
+        # 4) Xóa SAY TOTAL: chỉ xóa phần nội dung sau "SAY TOTAL" (thường sau dấu :)
+        say_rects = page.search_for("SAY TOTAL")
+        for rsay in say_rects:
+            best_key = None
+            best_dy = 10**9
+            for (bno, lno), ws in lines.items():
+                ly0 = min(t[1] for t in ws)
+                dy = abs(ly0 - rsay.y0)
+                if dy < best_dy:
+                    best_dy = dy
+                    best_key = (bno, lno)
 
-            page.add_redact_annot(fitz.Rect(max(0, x0), y0, pr.width, y1), fill=(1, 1, 1))
+            if best_key is None:
+                continue
 
-        # 3) Che dòng SAY TOTAL (phần chữ tiền) – che từ sau chữ "SAY TOTAL" tới hết dòng
-        say = page.search_for("SAY TOTAL")
-        if say:
-            r = say[0]
-            page.add_redact_annot(
-                fitz.Rect(r.x1 + 4, r.y0 - 4, pr.width, r.y1 + 10),
-                fill=(1, 1, 1)
-            )
+            for (x0, y0, x1, y1, w) in lines[best_key]:
+                if x0 > rsay.x1 + 3:  # phần sau SAY TOTAL
+                    redact_word_bbox(x0, y0, x1, y1)
 
+        # Apply redactions (xóa thật nội dung text)
         page.apply_redactions()
 
     out = io.BytesIO()
@@ -67,14 +104,14 @@ def redact_like_sample(pdf_bytes: bytes, margin: int = 6) -> bytes:
     doc.close()
     return out.getvalue()
 
+
 if uploaded:
+    st.subheader("Kết quả")
     for f in uploaded:
         cleaned = redact_like_sample(f.read(), margin=MARGIN)
 
-        # Lấy tên file gốc (bỏ .pdf)
+        # Rename output: (tên file cũ)_tosale.pdf
         base_name = f.name.rsplit(".", 1)[0]
-
-        # Tên file output theo yêu cầu
         output_name = f"{base_name}_tosale.pdf"
 
         st.download_button(
@@ -82,6 +119,7 @@ if uploaded:
             data=cleaned,
             file_name=output_name,
             mime="application/pdf",
-            key=f.name
+            key=f"dl_{f.name}"
         )
-
+else:
+    st.info("Upload PDF invoice")
