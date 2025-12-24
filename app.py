@@ -9,7 +9,7 @@ st.title("Invoice PDF - Xóa giá")
 uploaded = st.file_uploader("Upload invoice PDF", type=["pdf"], accept_multiple_files=True)
 
 # Lề an toàn nhỏ để che đúng chữ, không đè lên line
-#MARGIN = st.slider("Lề an toàn (px)", 0, 8, 2)
+MARGIN = st.slider("Lề an toàn (px)", 0, 8, 2)
 
 # Nhận diện token tiền: USD + các số dạng 151,308.00 / 467.0000000 / 0.00 / 0
 MONEY_TOKEN = re.compile(r"^(USD|\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\.\d+|\d+)$")
