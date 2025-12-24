@@ -3,7 +3,7 @@ import streamlit as st
 import fitz  # PyMuPDF
 
 st.set_page_config(page_title="Invoice - Remove Price", layout="wide")
-st.title("Invoice PDF - Xóa giá (che trắng, giữ nguyên khổ trang)")
+st.title("Invoice PDF - Xóa giá")
 
 uploaded = st.file_uploader("Upload invoice PDF", type=["pdf"], accept_multiple_files=True)
 
